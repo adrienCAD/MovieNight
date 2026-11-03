@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+# secrets and personal data
+config.json
+ratings.csv
+taste.json
+rejected.json
+mylist.json
