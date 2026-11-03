@@ -4,12 +4,14 @@ import csv
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import threading
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -19,6 +21,7 @@ PORT = 8765
 RATINGS = R.HERE / "ratings.csv"
 IMG = "https://image.tmdb.org/t/p/"
 MYLIST = R.HERE / "mylist.json"  # "maybe later" picks, stored as the card data shown in the UI
+list_lock = threading.Lock()  # mylist.json is read-modify-written from several requests
 csv_lock = threading.Lock()  # ratings.csv rewrites must not wait behind a slow recommendation
 lock = threading.Lock()  # one recommendation at a time (the local model isn't thread-safe)
 
@@ -40,8 +43,10 @@ def synopsis(m):
     return " ".join(sentences[:2])
 
 
-def details(item, year, genres, why, kind):
-    m = R.as_movie(R.tmdb(f"/{kind}/{item['id']}", append_to_response="credits"))
+def details(item, year, genres, why, kind, services):
+    m = R.as_movie(R.tmdb(f"/{kind}/{item['id']}", append_to_response="credits,watch/providers"))
+    flatrate = m["watch/providers"]["results"].get(R.REGION, {}).get("flatrate", [])
+    provider_ids = {p["provider_id"] for p in flatrate}
     return {
         "id": item["id"],
         "kind": kind,
@@ -54,6 +59,7 @@ def details(item, year, genres, why, kind):
         "tagline": m.get("tagline"),
         "synopsis": synopsis(m),
         "why": why,
+        "streaming": [s for s in services if R.SERVICES[s] in provider_ids],  # only the services you selected
         "poster": f"{IMG}w780{m['poster_path']}" if m.get("poster_path") else None,
         "cast": [
             {"name": c["name"], "role": c["character"],
@@ -65,6 +71,7 @@ def details(item, year, genres, why, kind):
 
 def recommend(req):
     kind = "tv" if req.get("kind") == "tv" else "movie"
+    styles = [s for s in req.get("styles", []) if s in R.STYLES]
     group = [R.PEOPLE[k] for k in req["people"] if k in R.PEOPLE] or list(R.PEOPLE.values())
     moods = [k for k in req["moods"] if k in R.MOODS and k != "7"]
     mood_label = " + ".join(R.MOODS[k][0] for k in moods) or R.MOODS["7"][0]
@@ -72,32 +79,111 @@ def recommend(req):
     label = f"{' + '.join(n for n, _ in group)} / {mood_label}"
     services = [s for s in req["services"] if s in R.SERVICES] or R.DEFAULT_SERVICES
     R.save_config(services=services)
+    exclude = set(req.get("exclude", []))  # ids already shown, for the "new picks" button
 
     ratings = R.load_ratings(RATINGS)
     seen = R.seen_titles(ratings) | {(R.norm(e["title"]), e["year"]) for e in load_list()}
     profile = R.taste_profile(ratings)
     genre_names = {g["id"]: g["name"] for g in R.tmdb(f"/genre/{kind}/list")["genres"]}
-    params, rules = R.build_query(services, group, mood_genres, genre_names, kind, req.get("max_cert", "auto"))
+    params, rules = R.build_query(services, group, mood_genres, genre_names, kind, req.get("max_cert", "auto"), styles)
 
     with lock:
-        ranked = R.candidates_for(seen, profile, params, rules, genre_names, kind)
-        summary = R.taste_summary(RATINGS, ratings, profile) if req.get("ai") else None
-        if summary:
-            picks = R.rerank(ranked, summary, label, mood_label)
-        else:
-            picks = [(p, None) for p in ranked[:R.TOP_N]]
-    return {"label": label, "movies": [details(m, y, g, why, kind) for (_, m, y, g), why in picks]}
+        R.CANCEL.clear()  # a Stop pressed while nothing was running must not kill this run
+        try:
+            return run(req, ratings, seen, profile, params, rules, genre_names, kind, styles, label, mood_label, services, exclude)
+        except R.Cancelled:
+            return {"cancelled": True}
+
+
+def run(req, ratings, seen, profile, params, rules, genre_names, kind, styles, label, mood_label, services, exclude):
+    ranked = [c for c in R.candidates_for(seen, profile, params, rules, genre_names, kind, styles) if c[1]["id"] not in exclude]
+    summary = R.taste_summary(RATINGS, ratings, profile) if req.get("ai") else None
+    if summary:
+        picks = R.rerank(ranked, summary, label, mood_label)
+    else:
+        picks = [(p, None) for p in ranked[:R.TOP_N]]
+    return {"label": label, "movies": [details(m, y, g, why, kind, services) for (_, m, y, g), why in picks]}
+
+
+REWATCH_MIN = 7  # only movies you rated at least this much
+REWATCH_N = 5
+
+
+def rewatch(req):
+    """5 favourites (rated 7+) to rewatch, preferring ones streaming on the chosen services and matching the mood."""
+    kind = "tv" if req.get("kind") == "tv" else "movie"
+    types = ("TV Series", "TV Mini Series") if kind == "tv" else ("Movie",)
+    moods = [k for k in req.get("moods", []) if k in R.MOODS and k != "7"]
+    mood_genres = {g for k in moods for g in R.MOODS[k][1]}
+    services = [s for s in req.get("services", []) if s in R.SERVICES] or R.DEFAULT_SERVICES
+    provider_ids = {R.SERVICES[s] for s in services}
+    exclude = set(req.get("exclude", []))
+
+    favs = [
+        r for r in R.load_ratings(RATINGS)
+        if r["Title Type"] in types and int(r["Your Rating"]) >= REWATCH_MIN and r["Const"] not in exclude
+        and (not mood_genres or mood_genres & {R.GENRE_ALIASES.get(g, g) for g in r["Genres"].split(", ")})
+    ]
+    random.shuffle(favs)
+
+    def check(r):
+        found = R.tmdb(f"/find/{r['Const']}", external_source="imdb_id").get(f"{kind}_results")
+        if not found:
+            return None
+        flatrate = R.tmdb(f"/{kind}/{found[0]['id']}/watch/providers")["results"].get(R.REGION, {}).get("flatrate", [])
+        return r, found[0]["id"], bool(provider_ids & {p["provider_id"] for p in flatrate})
+
+    available, other = [], []
+    with ThreadPoolExecutor(8) as pool:
+        for start in range(0, min(len(favs), 40), 10):  # check in batches; stop once there are enough streaming ones
+            for hit in pool.map(check, favs[start:start + 10]):
+                if hit:
+                    (available if hit[2] else other).append(hit)
+            if len(available) >= REWATCH_N:
+                break
+        picks = (available + other)[:REWATCH_N]
+
+        def card(hit):
+            r, tmdb_id, streaming = hit
+            m = R.as_movie(R.tmdb(f"/{kind}/{tmdb_id}"))
+            entry = details(m, (m.get("release_date") or "")[:4], [g["name"] for g in m["genres"]], None, kind, services)
+            return {**entry, "my_rating": int(r["Your Rating"]), "available": streaming, "const": r["Const"]}
+
+        return {"movies": list(pool.map(card, picks)), "remaining": max(len(favs) - 40, 0)}
 
 
 def load_list():
-    return json.loads(MYLIST.read_text()) if MYLIST.exists() else []
+    items = json.loads(MYLIST.read_text()) if MYLIST.exists() else []
+    for e in items:
+        e.setdefault("streaming", [])  # entries saved before availability was tracked
+    return items
 
 
 def drop_from_list(movie_id, kind):
-    items = load_list()
-    kept = [e for e in items if (e["id"], e["kind"]) != (movie_id, kind)]
-    if len(kept) != len(items):
-        MYLIST.write_text(json.dumps(kept, indent=1))
+    with list_lock:
+        items = load_list()
+        kept = [e for e in items if (e["id"], e["kind"]) != (movie_id, kind)]
+        if len(kept) != len(items):
+            MYLIST.write_text(json.dumps(kept, indent=1))
+
+
+def refresh_list(req):
+    """Re-check which of the selected services stream each saved title (availability changes over time)."""
+    services = [s for s in req.get("services", []) if s in R.SERVICES] or R.DEFAULT_SERVICES
+
+    def streaming(e):
+        flatrate = R.tmdb(f"/{e['kind']}/{e['id']}/watch/providers")["results"].get(R.REGION, {}).get("flatrate", [])
+        ids = {p["provider_id"] for p in flatrate}
+        return (e["id"], e["kind"]), [s for s in services if R.SERVICES[s] in ids]
+
+    with ThreadPoolExecutor(8) as pool:
+        fresh = dict(pool.map(streaming, load_list()))
+    with list_lock:  # reload: the list may have changed while TMDB was being queried
+        items = load_list()
+        for e in items:
+            e["streaming"] = fresh.get((e["id"], e["kind"]), e.get("streaming", []))
+        MYLIST.write_text(json.dumps(items, indent=1))
+    return items
 
 
 def later(req):
@@ -106,8 +192,10 @@ def later(req):
     if any((e["id"], e["kind"]) == (movie_id, kind) for e in load_list()):
         return {"saved": True}
     m = R.as_movie(R.tmdb(f"/{kind}/{movie_id}"))
-    entry = details(m, (m.get("release_date") or "")[:4], [g["name"] for g in m["genres"]], None, kind)
-    MYLIST.write_text(json.dumps(load_list() + [entry], indent=1))
+    entry = details(m, (m.get("release_date") or "")[:4], [g["name"] for g in m["genres"]], None, kind,
+                    R.load_config().get("services", R.DEFAULT_SERVICES))
+    with list_lock:
+        MYLIST.write_text(json.dumps(load_list() + [entry], indent=1))
     return {"saved": True}
 
 
@@ -203,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 "services": list(R.SERVICES),
                 "selected": cfg.get("services", R.DEFAULT_SERVICES),
                 "people": {k: n for k, (n, _) in R.PEOPLE.items()},
+                "styles": R.STYLES,
                 "moods": {k: label for k, (label, _) in R.MOODS.items()},
                 "tmdb_connected": bool(cfg.get("tmdb_session")),
             })
@@ -238,10 +327,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         try:
-            if self.path == "/api/recommend":
+            if self.path == "/api/cancel":
+                R.CANCEL.set()
+                self.send({"cancelled": True})
+            elif self.path == "/api/recommend":
                 self.send(recommend(body))
             elif self.path == "/api/reject":
                 self.send(reject(body))
+            elif self.path == "/api/rewatch":
+                self.send(rewatch(body))
+            elif self.path == "/api/mylist/refresh":
+                self.send(refresh_list(body))
             elif self.path == "/api/later":
                 self.send(later(body))
             elif self.path == "/api/mylist/remove":
@@ -264,6 +360,11 @@ def main():
     if "TMDB_API_KEY" not in os.environ or not RATINGS.exists():
         sys.exit(R.__doc__)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+
+    def warm_up():  # load the local model now so the first "Use local AI" search isn't slow
+        with lock:
+            R.llm("Hi", max_tokens=1)
+    threading.Thread(target=warm_up, daemon=True).start()
     print(f"Open http://localhost:{PORT}  (Ctrl+C to stop)")
     webbrowser.open(f"http://localhost:{PORT}")
     server.serve_forever()

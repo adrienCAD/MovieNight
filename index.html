@@ -8,9 +8,10 @@
   :root {
     --bg: #14161b; --panel: #1d2027; --line: #2b2f39; --text: #e9ebf0; --muted: #9aa1b2;
     --accent: #f5b942; --accent-ink: #231a05; --ok: #5ec27f;
+    --movie: #6ea8fe; --movie-ink: #06152e; --series: #4fd1b5; --series-ink: #04211b;
   }
   @media (prefers-color-scheme: light) {
-    :root { --bg: #f4f1ea; --panel: #fff; --line: #e1dccf; --text: #1c1d22; --muted: #6a6f7d; --accent: #c98a0b; --accent-ink: #fff; --ok: #2f8f55; }
+    :root { --bg: #f4f1ea; --panel: #fff; --line: #e1dccf; --text: #1c1d22; --muted: #6a6f7d; --accent: #c98a0b; --accent-ink: #fff; --ok: #2f8f55; --movie: #2f6fd6; --movie-ink: #fff; --series: #1b9a82; --series-ink: #fff; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, sans-serif; }
@@ -27,6 +28,9 @@
   .chips input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
   button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 8px 16px; }
   button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 700; padding: 10px 24px; }
+  button.movies { background: var(--movie); color: var(--movie-ink); border-color: var(--movie); font-weight: 700; padding: 10px 24px; }
+  button.series { background: var(--series); color: var(--series-ink); border-color: var(--series); font-weight: 700; padding: 10px 24px; }
+  button.stop { border-color: #e5645f; color: #e5645f; font-weight: 700; padding: 10px 24px; }
   button:disabled { opacity: .6; cursor: wait; }
   .row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin: 16px 0; }
   .note { color: var(--muted); font-size: 14px; }
@@ -55,6 +59,10 @@
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; font-weight: 500; }
   td a { color: var(--text); }
+  .card.unavailable { opacity: .55; }
+  .card.unavailable .poster { filter: grayscale(1); }
+  .where { margin: 0 0 8px; color: var(--ok); font-size: 15px; }
+  .where.none { color: var(--muted); }
   .done { color: var(--ok); }
   .error { color: #e5645f; }
   @media (max-width: 680px) { .card { grid-template-columns: 1fr; } .poster { max-width: 300px; } }
@@ -75,17 +83,25 @@
   <section id="tab-recs">
   <fieldset><legend>Who's watching</legend><div class="chips" id="people"></div></fieldset>
   <fieldset><legend>Mood (pick one or more)</legend><div class="chips" id="moods"></div></fieldset>
-  <fieldset><legend>Max age rating (movies)</legend><div class="chips" id="certs"></div></fieldset>
+  <fieldset><legend>Type (none selected = any)</legend><div class="chips" id="styles"></div></fieldset>
+  <fieldset><legend>Age rating: show movies up to…</legend><div class="chips" id="certs"></div></fieldset>
   <fieldset><legend>Streaming services</legend><div class="chips" id="services"></div></fieldset>
 
   <div class="row">
-    <button class="primary" id="go">Find movies</button>
-    <button class="primary" id="go-tv">Find series</button>
+    <button class="movies" id="go">Find movies</button>
+    <button class="series" id="go-tv">Find series</button>
+    <button class="stop" id="stop" hidden>Stop AI</button>
     <label class="note"><input type="checkbox" id="ai" checked> Use local AI (slower, personalised; first run downloads the model)</label>
   </div>
 
   <div id="status" class="note"></div>
   <div id="results"></div>
+  <div class="row" id="rewatch-bar" hidden>
+    <button id="recycle" title="Same search, five different picks">↻ 5 new picks</button>
+    <button id="rewatch-btn">Or rewatch one of your favourites</button>
+    <span class="note">Rewatch: five you rated 7+, preferring what's streaming on your services.</span>
+  </div>
+  <div id="rewatch"></div>
   </section>
 
   <section id="tab-list" hidden>
@@ -124,7 +140,8 @@ async function init() {
   cfg = await (await fetch("/api/config")).json();
   chips("people", cfg.people, "people", "checkbox", Object.keys(cfg.people));
   chips("moods", cfg.moods, "moods", "checkbox", ["7"]);
-  chips("certs", { auto: "Auto (PG-13 with kids)", PG: "PG", "PG-13": "PG-13", R: "R", "NC-17": "Anything (NC-17)" }, "certs", "radio", ["auto"]);
+  chips("styles", cfg.styles, "styles", "checkbox", []);
+  chips("certs", { auto: "Auto (up to PG-13 if kids watch)", PG: "Up to PG", "PG-13": "Up to PG-13", R: "Up to R", any: "No limit (NC-17 included)" }, "certs", "radio", ["auto"]);
   chips("services", Object.fromEntries(cfg.services.map((s) => [s, s])), "services", "checkbox", cfg.selected);
   $("banner").innerHTML = cfg.tmdb_connected ? "" :
     `<div class="banner">Ratings are saved to <code>ratings.csv</code>. <a href="/tmdb/login">Connect TMDB</a> to also send them to your TMDB account.</div>`;
@@ -138,15 +155,19 @@ function movieCard(m, mode = "rec") {
       ${esc(a.name)}<small>${esc(a.role)}</small>
     </div>`).join("");
   return `
-  <article class="card" data-id="${m.id}" data-kind="${m.kind}">
+  <article class="card${mode !== "rec" && !m.streaming.length ? " unavailable" : ""}" data-id="${m.id}" data-kind="${m.kind}">
     ${m.poster ? `<img class="poster" src="${m.poster}" alt="Poster of ${esc(m.title)}">` : `<div class="poster"></div>`}
     <div>
       <h2>${esc(m.title)}</h2>
       <div class="meta">${esc(meta)}</div>
       ${m.tagline ? `<p class="tagline">${esc(m.tagline)}</p>` : ""}
+      ${m.streaming.length
+        ? `<p class="where">▶ Watch on <b>${m.streaming.map(esc).join("</b>, <b>")}</b></p>`
+        : `<p class="where none">Not streaming on your selected services right now</p>`}
       <p>${esc(m.synopsis)}</p>
       ${m.why ? `<p class="why">Why you: ${esc(m.why)}</p>` : ""}
       <div class="cast">${cast}</div>
+      ${mode === "rewatch" ? `<p class="why">You rated it ${m.my_rating}/10</p>` : `
       <div class="seen">
         <button class="seen-btn">I've seen it</button>
         ${mode === "list"
@@ -158,36 +179,71 @@ function movieCard(m, mode = "rec") {
           <button class="primary save" disabled>Save rating</button>
         </div>
         <span class="result note"></span>
-      </div>
+      </div>`}
     </div>
   </article>`;
 }
 
 let kind = "movie";
-const run = (k) => async () => {
+let shownIds = [];
+const run = (k, recycle = false) => async () => {
   kind = k;
-  const buttons = [$("go"), $("go-tv")];
+  const buttons = [$("go"), $("go-tv"), $("recycle"), $("rewatch-btn")];
   buttons.forEach((b) => (b.disabled = true));
+  refreshList();  // in the background: re-check where your saved titles stream, using the services selected now
   $("results").innerHTML = "";
+  $("rewatch").innerHTML = "";
+  $("rewatch-bar").hidden = true;
   $("status").className = "note";
   $("status").textContent = $("ai").checked ? "Thinking… the local model can take a minute." : "Searching…";
+  $("stop").hidden = !$("ai").checked;
+  $("stop").disabled = false;
   try {
     const res = await fetch("/api/recommend", {
       method: "POST",
-      body: JSON.stringify({ people: checked("people"), moods: checked("moods"), services: checked("services"), ai: $("ai").checked, kind, max_cert: checked("certs")[0] }),
+      body: JSON.stringify({ people: checked("people"), moods: checked("moods"), services: checked("services"), ai: $("ai").checked, kind, max_cert: checked("certs")[0], styles: checked("styles"), exclude: recycle ? shownIds : [] }),
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
-    $("status").textContent = `Tonight: ${data.label}`;
-    $("results").innerHTML = data.movies.map((m) => movieCard(m)).join("") || "<p>Nothing found. Try other moods or services.</p>";
+    if (data.cancelled) {
+      $("status").textContent = "Stopped. Change your picks and launch again.";
+    } else {
+      $("status").textContent = `Tonight: ${data.label}`;
+      shownIds = [...(recycle ? shownIds : []), ...data.movies.map((m) => m.id)];
+      $("results").innerHTML = data.movies.map((m) => movieCard(m)).join("") ||
+        `<p>${recycle ? "No more new picks for these settings. Change a filter, or press Find again to start over." : "Nothing found. Try other moods, types or services."}</p>`;
+      $("rewatch-bar").hidden = false;
+      shownFavs = [];
+      $("rewatch-btn").textContent = "Or rewatch one of your favourites";
+    }
   } catch (e) {
     $("status").className = "error";
     $("status").textContent = e.message;
   }
+  $("stop").hidden = true;
   buttons.forEach((b) => (b.disabled = false));
+};
+let shownFavs = [];
+$("rewatch-btn").onclick = async () => {
+  $("rewatch-btn").disabled = true;
+  const res = await post("/api/rewatch", { kind, moods: checked("moods"), services: checked("services"), exclude: shownFavs });
+  $("rewatch-btn").disabled = false;
+  if (res.error) { $("rewatch").innerHTML = `<p class="error">${esc(res.error)}</p>`; return; }
+  if (!res.movies.length) { shownFavs = []; $("rewatch").innerHTML = "<p>No more favourites for this mood. Press again to start over.</p>"; return; }
+  shownFavs.push(...res.movies.map((m) => m.const));
+  $("rewatch").innerHTML = res.movies.map((m) => movieCard(m, "rewatch")).join("");
+  $("rewatch-btn").textContent = "↻ 5 other favourites";
+  $("rewatch").scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
+$("stop").onclick = async () => {
+  $("stop").disabled = true;
+  $("status").textContent = "Stopping…";
+  await fetch("/api/cancel", { method: "POST", body: "{}" });
 };
 $("go").onclick = run("movie");
 $("go-tv").onclick = run("tv");
+$("recycle").onclick = () => run(kind, true)();
 
 const post = async (url, body) => (await fetch(url, { method: "POST", body: JSON.stringify(body) })).json();
 
@@ -239,6 +295,24 @@ document.querySelector("main").addEventListener("click", async (e) => {
 });
 
 // ---- tabs, My list, My ratings
+// Re-check availability of the saved list for the selected services; re-draws the list only if the tab is open and something changed.
+async function refreshList() {
+  try {
+    const before = JSON.stringify(listItems.map((m) => m.streaming));
+    const res = await post("/api/mylist/refresh", { services: checked("services") });
+    if (res.error) return;
+    listItems = res;
+    $("list-count").textContent = res.length ? `(${res.length})` : "";
+    if (!$("tab-list").hidden && JSON.stringify(res.map((m) => m.streaming)) !== before) drawList();
+  } catch (e) { /* offline or TMDB hiccup: keep the saved availability */ }
+}
+
+let listItems = [];
+function drawList() {
+  $("list").innerHTML = listItems.map((m) => movieCard(m, "list")).join("");
+  $("list-empty").hidden = listItems.length > 0;
+}
+
 async function refreshListCount() {
   const items = await (await fetch("/api/mylist")).json();
   $("list-count").textContent = items.length ? `(${items.length})` : "";
@@ -268,9 +342,9 @@ async function openTab(name) {
   document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
   ["recs", "list", "ratings"].forEach((t) => ($(`tab-${t}`).hidden = t !== name));
   if (name === "list") {
-    const items = await refreshListCount();
-    $("list").innerHTML = items.map((m) => movieCard(m, "list")).join("");
-    $("list-empty").hidden = items.length > 0;
+    listItems = await refreshListCount();
+    drawList();
+    refreshList();
   }
   if (name === "ratings") { ratings = await (await fetch("/api/ratings")).json(); renderRatings(); }
 }

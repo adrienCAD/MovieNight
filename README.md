@@ -16,8 +16,14 @@ Pick who's watching, a mood (or several), a maximum age rating and your streamin
 ![Find movies](docs/find-movies.png)
 
 - **Who's watching** applies household rules: for example, anime only when everyone is OK with it, only big-studio animation for some viewers, and a PG-13 cap when kids are in the room.
-- **Max age rating** overrides that cap: PG, PG-13, R or anything. Handy for horror nights.
+- **Type** narrows the look: live action, anime, other animation or stop-motion. Pick several or none (none = any). Handy when you don't want anime tonight.
+- **Age rating** sets the highest rating shown, not the only one: "Up to R" includes G, PG, PG-13 and R, and "No limit" adds NC-17. It overrides the PG-13 cap for kids. Handy for horror nights.
+- Each pick says which of your selected services it is streaming on.
+- With **Use local AI** on, a **Stop AI** button appears while the model is thinking. Stop it, change your picks and launch again.
 - Each card has three actions: **I've seen it** (rate it 1–10), **Maybe later** (save it) and **Not for me** (never suggest it again, and it counts against that genre in your taste profile).
+
+- At the end of the results, **↻ 5 new picks** reruns the same search with five different titles, never repeating what you've already seen on screen.
+- Next to it, **Or rewatch one of your favourites** shows five titles you rated 7+, preferring ones streaming on your services and matching the chosen mood. **↻ 5 other favourites** reshuffles without repeats.
 
 ## Find series
 
@@ -29,7 +35,7 @@ TMDB can't filter series by age rating, so the age-rating setting only applies t
 
 ## My list
 
-**Maybe later** saves a pick to *My list*. Switch between your list and fresh recommendations with the tabs. Items on the list are left out of future recommendations. Rating one from the list removes it.
+**Maybe later** saves a pick to *My list*. Switch between your list and fresh recommendations with the tabs. Items on the list are left out of future recommendations. Each saved title shows which of your selected services stream it; this is re-checked in the background whenever you search or open the tab, and titles not streaming on your services are greyed out. Rating one from the list removes it.
 
 ![My list](docs/my-list.png)
 

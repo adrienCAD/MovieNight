@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -64,6 +65,10 @@ MOODS = {
 VIDEO_TYPES = ("Movie", "TV Series", "TV Mini Series")  # ratings that count as seen / shape taste
 # TMDB TV genres are merged ("Action & Adventure", "Sci-Fi & Fantasy"); map our mood genre names onto their parts
 TV_GENRE_PARTS = {"Science Fiction": "Sci-Fi", "Horror": "Mystery", "Thriller": "Crime", "Romance": "Drama", "Family": "Kids"}
+
+# What it looks like. "stop" has no TMDB genre, so it is found through the "stop motion" keyword.
+STYLES = {"live": "Live action", "anime": "Anime", "animation": "Animation (non-anime)", "stop": "Stop-motion"}
+STOP_MOTION_KEYWORD = 10121
 
 # IMDb genre name -> TMDB genre name
 GENRE_ALIASES = {"Sci-Fi": "Science Fiction", "Musical": "Music", "Film-Noir": "Crime", "Sport": "Drama"}
@@ -190,18 +195,32 @@ def animation_ok(m, rules, kind="movie"):
 
 
 _llm = None
+CANCEL = threading.Event()  # set by the UI's Stop button; checked between generated tokens
+
+
+class Cancelled(Exception):
+    pass
 
 
 def llm(prompt, max_tokens=500):
     """Ask the local MLX model; returns None if mlx-lm / the model isn't available."""
     global _llm
     try:
-        from mlx_lm import generate, load
+        from mlx_lm import load, stream_generate
+        if CANCEL.is_set():
+            raise Cancelled
         if _llm is None:
             _llm = load(MODEL)
         model, tok = _llm
         chat = tok.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True)
-        return generate(model, tok, prompt=chat, max_tokens=max_tokens).strip()
+        text = ""
+        for chunk in stream_generate(model, tok, prompt=chat, max_tokens=max_tokens):
+            if CANCEL.is_set():
+                raise Cancelled
+            text += chunk.text
+        return text.strip()
+    except Cancelled:
+        raise
     except Exception as e:  # missing package, no network for first download, ...
         print(f"(local model unavailable: {type(e).__name__}; using plain scoring)")
         return None
@@ -297,20 +316,37 @@ def record_ratings(ratings_path, picks, feedback, kind="movie"):
     return len(rows)
 
 
-def candidates_for(seen, profile, params, rules, genre_names, kind="movie"):
-    scored = []
-    for page in range(1, 9):
-        for m in map(as_movie, tmdb(f"/discover/{kind}", page=page, **params)["results"]):
-            year = (m.get("release_date") or "")[:4]
-            if (norm(m["title"]), year) in seen or not animation_ok(m, rules, kind):
-                continue
-            genres = [genre_names[g] for g in m["genre_ids"] if g in genre_names]
-            affinity = sum(profile.get(g, 0) for g in genres) / max(len(genres), 1)
-            scored.append((affinity + (m["vote_average"] - 6.5) * 0.5, m, year, genres))
+def style_ok(m, styles):
+    """Live action = not animated; anime = Japanese animation; animation = any other animation."""
+    animated = 16 in m["genre_ids"]
+    anime = animated and m["original_language"] == "ja"
+    return ((not animated and "live" in styles) or (anime and "anime" in styles)
+            or (animated and not anime and "animation" in styles))
+
+
+def candidates_for(seen, profile, params, rules, genre_names, kind="movie", styles=()):
+    styles = set(styles) & set(STYLES)
+    scored, found = [], set()
+
+    def collect(query, pages, wanted):
+        for page in range(1, pages + 1):
+            for m in map(as_movie, tmdb(f"/discover/{kind}", page=page, **query)["results"]):
+                year = (m.get("release_date") or "")[:4]
+                if m["id"] in found or (norm(m["title"]), year) in seen or not wanted(m) or not animation_ok(m, rules, kind):
+                    continue
+                found.add(m["id"])
+                genres = [genre_names[g] for g in m["genre_ids"] if g in genre_names]
+                affinity = sum(profile.get(g, 0) for g in genres) / max(len(genres), 1)
+                scored.append((affinity + (m["vote_average"] - 6.5) * 0.5, m, year, genres))
+
+    if "stop" in styles:
+        collect({**params, "with_keywords": STOP_MOTION_KEYWORD}, 4, lambda m: True)
+    if not styles or styles - {"stop"}:
+        collect(params, 8, (lambda m: True) if not styles else (lambda m: style_ok(m, styles)))
     return sorted(scored, key=lambda s: -s[0])
 
 
-def build_query(services, group, mood_genres, genre_names, kind="movie", max_cert="auto"):
+def build_query(services, group, mood_genres, genre_names, kind="movie", max_cert="auto", styles=()):
     """TMDB discover params + animation rules for this group, services and mood."""
     rules = {
         "anime": min(t["anime"] for _, t in group),
@@ -323,6 +359,11 @@ def build_query(services, group, mood_genres, genre_names, kind="movie", max_cer
         sort_by="popularity.desc",
         **{"vote_count.gte": 500},
     )
+    styles = set(styles) & set(STYLES)
+    if styles == {"anime"}:  # narrow the discover query itself so the first pages aren't mostly live action
+        params["with_original_language"] = "ja"
+    elif styles == {"live"}:
+        params["without_genres"] = 16
     if kind == "tv":
         wanted = {TV_GENRE_PARTS.get(g, g) for g in mood_genres}
         mood_ids = [i for i, n in genre_names.items() if wanted & set(n.split(" & "))]
@@ -332,7 +373,7 @@ def build_query(services, group, mood_genres, genre_names, kind="movie", max_cer
         params["with_genres"] = "|".join(map(str, mood_ids))
     if max_cert == "auto" and any(t["kid"] for _, t in group):
         max_cert = "PG-13"
-    if kind == "movie" and max_cert in ("G", "PG", "PG-13", "R"):  # TMDB has no certification filter for TV
+    if kind == "movie" and max_cert in ("G", "PG", "PG-13", "R"):  # "any" adds no filter; TMDB has none for TV
         params.update(certification_country="US", **{"certification.lte": max_cert})
     return params, rules
 
